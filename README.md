@@ -1,1 +1,1 @@
-# Trade-J
+TradeJournal
