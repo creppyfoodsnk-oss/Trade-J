@@ -97,7 +97,14 @@ const SEED=[
 ];
 const PSYCH={1:{e:"😤",l:"Emotional"},2:{e:"😟",l:"Uncertain"},3:{e:"😐",l:"Neutral"},4:{e:"🙂",l:"Confident"},5:{e:"🧘",l:"In the Zone"}};
 const SYMS=["XAUUSD","GBPJPY","EURUSD","USDJPY","BTCUSD","GBPUSD","AUDUSD"];
-const DEFSETT={name:"My Trading Account",sym:"XAUUSD",lots:"0.01",cur:"USD",tz:"UTC",lossLim:"50",maxTrades:"10",defComm:"-0.07",showPsych:true,confirmDel:true};
+const DEFSETT={name:"My Trading Account",sym:"XAUUSD",lots:"0.01",cur:"USD",tz:"UTC",lossLim:"50",maxTrades:"10",defComm:"-0.07",showPsych:true,confirmDel:true,
+  // Trading discipline rules
+  londonStart:"05:00",londonEnd:"09:00",
+  nyStart:"10:00",nyEnd:"14:00",
+  maxLots:"0.02",
+  enableHourFlag:true,enableLotFlag:true,
+  // Cooldown after a loss
+  cooldownMins:"30",enableCooldown:true};
 
 // ── State ────────────────────────────────────────────────────────────────────
 let state={
@@ -119,6 +126,7 @@ let state={
   syncStatus:null,
   syncMsg:"",
   lastSync:localStorage.getItem("tj_last_sync")||"",
+  cooldownUntil:parseInt(localStorage.getItem("tj_cooldown_until")||"0",10),
 };
 
 function setState(patch){Object.assign(state,patch);render();}
@@ -136,6 +144,37 @@ const f$=n=>(n>=0?"+":"")+n.toFixed(2);
 const net=t=>t.pnl+(t.comm||0);
 const col=v=>v>=0?"#4ADE80":"#F87171";
 
+// ── Trading discipline flags ─────────────────────────────────────────────────
+// Returns true if a HH:MM time string falls within a [start,end) window,
+// handling windows that wrap past midnight (e.g. 22:00–02:00).
+function inWindow(time,start,end){
+  if(!time||!start||!end)return false;
+  const t=time.replace(":",""),s=start.replace(":",""),e=end.replace(":","");
+  if(s<=e)return t>=s&&t<=e;
+  return t>=s||t<=e; // wraps past midnight
+}
+
+function isOffHours(t,settings){
+  if(!settings.enableHourFlag)return false;
+  const inLondon=inWindow(t.eT,settings.londonStart,settings.londonEnd);
+  const inNY=inWindow(t.eT,settings.nyStart,settings.nyEnd);
+  return!(inLondon||inNY);
+}
+
+function isOversized(t,settings){
+  if(!settings.enableLotFlag)return false;
+  const maxLots=parseFloat(settings.maxLots);
+  if(isNaN(maxLots))return false;
+  return t.lots>maxLots;
+}
+
+function disciplineFlags(t,settings){
+  const flags=[];
+  if(isOffHours(t,settings))flags.push({icon:"⏰",label:"Off-hours",color:"#F0B429"});
+  if(isOversized(t,settings))flags.push({icon:"⚠️",label:"Oversized ("+t.lots+" lots)",color:"#F87171"});
+  return flags;
+}
+
 function calcStats(trades){
   const nets=trades.map(net);
   const total=nets.reduce((a,b)=>a+b,0);
@@ -146,7 +185,8 @@ function calcStats(trades){
   const psych=trades.length?trades.reduce((a,t)=>a+(t.psych||3),0)/trades.length:0;
   const cg=trades.filter(t=>t.psych>=4);
   const cwr=cg.length?(cg.filter(t=>net(t)>0).length/cg.length)*100:0;
-  return{total,wr:trades.length?(wins.length/trades.length)*100:0,wins:wins.length,losses:losses.length,n:trades.length,aw,al,rr:al?aw/al:0,comm,psych,cwr};
+  const flaggedNotes=trades.filter(t=>/said i was done|revenge trade|impulsive size/i.test(t.notes||"")).length;
+  return{total,wr:trades.length?(wins.length/trades.length)*100:0,wins:wins.length,losses:losses.length,n:trades.length,aw,al,rr:al?aw/al:0,comm,psych,cwr,flaggedNotes};
 }
 
 function buildCurve(trades){
@@ -303,14 +343,39 @@ function selField(lbl,id,opts,val){
 
 // ── Views ─────────────────────────────────────────────────────────────────────
 function viewOverview(){
-  const {trades}=state;
+  const {trades,settings}=state;
   const st=calcStats(trades);
   const curve=buildCurve(trades);
+
+  // Discipline analysis
+  const offHoursTrades=trades.filter(t=>isOffHours(t,settings));
+  const oversizedTrades=trades.filter(t=>isOversized(t,settings));
+  const offHoursNet=offHoursTrades.reduce((a,t)=>a+net(t),0);
+  const oversizedNet=oversizedTrades.reduce((a,t)=>a+net(t),0);
+  const disciplinePanel=(settings.enableHourFlag||settings.enableLotFlag)?`
+    <div class="panel" style="border-color:${(offHoursTrades.length||oversizedTrades.length)?"#F0B429":"#21262D"}">
+      <div class="panel-title">🎯 Discipline Watch</div>
+      <div class="grid" style="grid-template-columns:1fr 1fr">
+        ${settings.enableHourFlag?`<div>
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="font-size:16px">⏰</span><span style="color:#C9D1D9;font-size:13px;font-weight:600">Off-hours trades</span></div>
+          <div style="font-family:monospace;font-size:22px;font-weight:700;color:${offHoursTrades.length?"#F0B429":"#4ADE80"}">${offHoursTrades.length}</div>
+          <div style="color:#8B949E;font-size:11px">of ${trades.length} total ${offHoursTrades.length?`· net ${f$(offHoursNet)}`:""}</div>
+        </div>`:""}
+        ${settings.enableLotFlag?`<div>
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="font-size:16px">⚠️</span><span style="color:#C9D1D9;font-size:13px;font-weight:600">Oversized trades</span></div>
+          <div style="font-family:monospace;font-size:22px;font-weight:700;color:${oversizedTrades.length?"#F87171":"#4ADE80"}">${oversizedTrades.length}</div>
+          <div style="color:#8B949E;font-size:11px">above ${settings.maxLots} lots ${oversizedTrades.length?`· net ${f$(oversizedNet)}`:""}</div>
+        </div>`:""}
+      </div>
+      ${(offHoursTrades.length||oversizedTrades.length)?`<div style="color:#8B949E;font-size:11px;margin-top:12px;line-height:1.6">Tap <b>Trade Log</b> and look for ⏰/⚠️ icons to review these trades — adjust Settings if your sessions or sizing have changed this month.</div>`:`<div style="color:#4ADE80;font-size:12px;margin-top:12px">✓ All trades within your set hours and lot limits.</div>`}
+    </div>`:"";
+
   return`
     <div class="panel">
       <div class="panel-title">Cumulative Equity</div>
       <div class="chart-wrap">${lineChart(curve,"date","cum","#F0B429",160)}</div>
     </div>
+    ${disciplinePanel}
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
       <div class="panel">
         <div class="panel-title">Daily P&L</div>
@@ -318,8 +383,8 @@ function viewOverview(){
       </div>
       <div class="panel">
         <div class="panel-title">Breakdown</div>
-        ${[["Trades",st.n],["Winning",st.wins+" ("+st.wr.toFixed(0)+"%)"],["Losing",st.losses],["Best Day","$"+Math.max(...curve.map(d=>d.daily)).toFixed(2)],["Worst Day","$"+Math.min(...curve.map(d=>d.daily)).toFixed(2)],["Commissions","$"+Math.abs(st.comm).toFixed(2)],["Avg Psych",st.psych.toFixed(1)+"/5"]]
-          .map(([k,v])=>`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #21262D"><span style="color:#8B949E;font-size:13px">${k}</span><span style="font-family:monospace;font-size:13px">${v}</span></div>`).join("")}
+        ${[["Trades",st.n],["Winning",st.wins+" ("+st.wr.toFixed(0)+"%)"],["Losing",st.losses],["Best Day","$"+Math.max(...curve.map(d=>d.daily)).toFixed(2)],["Worst Day","$"+Math.min(...curve.map(d=>d.daily)).toFixed(2)],["Commissions","$"+Math.abs(st.comm).toFixed(2)],["Avg Psych",st.psych.toFixed(1)+"/5"],["Discipline-tagged",st.flaggedNotes+" trades"]]
+          .map(([k,v])=>`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #21262D"><span style="color:#8B949E;font-size:13px">${k}</span><span style="font-family:monospace;font-size:13px;${k==="Discipline-tagged"&&st.flaggedNotes>0?"color:#F0B429":""}">${v}</span></div>`).join("")}
       </div>
     </div>`;
 }
@@ -383,7 +448,10 @@ function viewLog(){
     const n=net(t),pi=PSYCH[t.psych]||PSYCH[3];
     const isExp=expandedRow===t.id;
     const exitBadge=t.exit==="tp"?badge("TP","#4ADE80"):t.exit==="sl"?badge("SL","#F87171"):badge("MNL","#8B949E");
+    const flags=disciplineFlags(t,settings);
+    const flagIcons=flags.map(fl=>`<span title="${fl.label}" style="margin-left:4px">${fl.icon}</span>`).join("");
     const expContent=isExp?`<tr class="exp-row"><td class="exp-cell" colspan="${headers.length}">
+      ${flags.length?`<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">${flags.map(fl=>`<span style="background:${fl.color}22;color:${fl.color};border-radius:5px;padding:4px 10px;font-size:12px;font-weight:600">${fl.icon} ${fl.label}</span>`).join("")}</div>`:""}
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px">
         <div><div style="color:#8B949E;font-size:10px;text-transform:uppercase;margin-bottom:6px">Psychology</div>${psychStars(t.psych,"")}</div>
         <div><div style="color:#8B949E;font-size:10px;text-transform:uppercase;margin-bottom:6px">TradingView</div>${t.tv?`<button class="btn-o" style="padding:5px 12px;font-size:12px" onclick="openTV('${t.tv}')">📊 Preview</button> <a href="${t.tv}" target="_blank" style="color:#555E6D;font-size:11px">↗ Open</a>`:"<span style='color:#555E6D;font-size:12px'>No chart</span>"}</div>
@@ -391,7 +459,7 @@ function viewLog(){
       </div>
     </td></tr>`:"";
     return`<tr class="trow" onclick="toggleRow(${t.id})" style="border-bottom:${isExp?"none":"1px solid #21262D"}">
-      <td style="font-family:monospace;font-size:11px;color:#8B949E;white-space:nowrap"><div>${t.date}</div><div style="color:#555E6D;font-size:10px">${t.eT} → ${t.cT}</div></td>
+      <td style="font-family:monospace;font-size:11px;color:#8B949E;white-space:nowrap"><div>${t.date}</div><div style="color:#555E6D;font-size:10px">${t.eT} → ${t.cT}${flagIcons}</div></td>
       <td>${badge(t.type.toUpperCase(),t.type==="buy"?"#4ADE80":"#F87171")}</td>
       <td style="color:#F0B429;font-family:monospace;font-weight:600">${t.sym}</td>
       <td style="font-family:monospace;font-size:12px">${t.lots}</td>
@@ -424,10 +492,22 @@ function viewLog(){
 
 function viewAdd(){
   const f=state.addForm||(state.addForm=blankForm(),state.addForm);
-  const {aiText,aiLoading}=state;
-  const pnl=(()=>{const op=parseFloat(f.eP),cl=parseFloat(f.cP),lo=parseFloat(f.lots);if(isNaN(op)||isNaN(cl)||isNaN(lo))return null;const pv=f.sym==="XAUUSD"?100:f.sym==="GBPJPY"?0.076:10;return(f.type==="buy"?1:-1)*(cl-op)*lo*pv;})();
-  const netVal=pnl!==null?pnl+(parseFloat(f.comm)||0):null;
-  return`<div class="panel">
+  const {aiText,aiLoading,cooldownUntil,settings}=state;
+  const remainingMs=cooldownUntil-Date.now();
+  const inCooldown=settings.enableCooldown&&remainingMs>0;
+  const cooldownBanner=inCooldown?`
+    <div class="panel" style="border-color:#F87171;background:rgba(248,113,113,0.06)">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <span style="font-size:24px">🧘</span>
+        <div style="flex:1">
+          <div style="color:#F87171;font-weight:700;font-size:14px;margin-bottom:2px">Cooldown after a loss</div>
+          <div style="color:#C9D1D9;font-size:13px">Your last trade lost money. Recommended pause: <span id="cooldown_timer" style="font-family:monospace;font-weight:700;color:#F0B429">${formatCooldown(remainingMs)}</span></div>
+          <div style="color:#8B949E;font-size:11px;margin-top:4px">This won't stop you — but take a breath before the next entry.</div>
+        </div>
+        <button class="btn-o" style="white-space:nowrap" onclick="dismissCooldown()">I've reviewed, continue</button>
+      </div>
+    </div>`:"";
+  return`${cooldownBanner}<div class="panel">
     <div class="panel-title">+ LOG NEW TRADE</div>
     <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(130px,1fr));margin-bottom:12px">
       ${inpField("Date","f_date","date",f.date)}
@@ -443,19 +523,79 @@ function viewAdd(){
     </div>
     <div style="margin-bottom:12px"><label class="lbl">Psychology Rating</label><div style="background:#0D1117;border:1px solid #30363D;border-radius:6px;padding:10px 12px">${psychStars(f.psych,"form")}</div></div>
     <div style="margin-bottom:12px"><label class="lbl">TradingView Chart Link</label><input type="url" class="inp" id="f_tv" value="${f.tv||""}" placeholder="https://www.tradingview.com/chart/..." oninput="formChange('f_tv',this.value)"/></div>
-    <div style="margin-bottom:12px"><label class="lbl">Notes</label><textarea class="inp" rows="2" style="resize:vertical" id="f_notes" oninput="formChange('f_notes',this.value)">${f.notes||""}</textarea></div>
-    ${pnl!==null?`<div style="padding:10px 12px;background:#0D1117;border-radius:6px;display:flex;gap:18px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
-      <span style="color:#8B949E;font-size:12px">Gross:</span><span style="font-family:monospace;font-weight:700;font-size:16px;color:${col(pnl)}">${f$(pnl)}</span>
-      <span style="color:#8B949E;font-size:12px">Net:</span><span style="font-family:monospace;font-weight:700;font-size:16px;color:${col(netVal)}">${f$(netVal)}</span>
-    </div>`:""}
+    <div style="margin-bottom:12px">
+      <label class="lbl">Notes</label>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+        <button class="btn-o" style="padding:5px 10px;font-size:11px" onclick="addNoteTag('Said I was done for the day, traded anyway')">+ Said done, traded anyway</button>
+        <button class="btn-o" style="padding:5px 10px;font-size:11px" onclick="addNoteTag('Revenge trade after a loss')">+ Revenge trade</button>
+        <button class="btn-o" style="padding:5px 10px;font-size:11px" onclick="addNoteTag('Increased size impulsively')">+ Impulsive size-up</button>
+      </div>
+      <textarea class="inp" rows="2" style="resize:vertical" id="f_notes" oninput="formChange('f_notes',this.value)">${f.notes||""}</textarea>
+    </div>
+    <div id="pnl_preview">${pnlPreviewHTML(f)}</div>
     ${aiLoading?`<div style="background:#161B22;border:1px solid #30363D;border-radius:8px;padding:18px;margin-top:12px;color:#8B949E">⟳ Analysing…</div>`:""}
     ${aiText&&!aiLoading?`<div class="ai-box"><div class="ai-title">⚡ AI Analysis</div><div class="ai-text">${aiText}</div></div>`:""}
-    <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
-      <button class="btn-o" onclick="doAnalyse()" ${aiLoading||!f.eP||!f.cP||!f.lots?"disabled":""} style="opacity:${!f.eP||!f.cP||!f.lots?.4:1}">${aiLoading?"Analysing…":"⚡ Analyse with AI"}</button>
-      <button class="btn" onclick="saveTrade()" ${!f.date||!f.eP||!f.cP||!f.lots?"disabled":""} style="opacity:${!f.date||!f.eP||!f.cP||!f.lots?.4:1}">Save Trade</button>
+    <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap" id="add_buttons">
+      ${addButtonsHTML(f,aiLoading)}
     </div>
   </div>`;
 }
+
+function pnlPreviewHTML(f){
+  const op=parseFloat(f.eP),cl=parseFloat(f.cP),lo=parseFloat(f.lots);
+  if(isNaN(op)||isNaN(cl)||isNaN(lo))return"";
+  const pv=f.sym==="XAUUSD"?100:f.sym==="GBPJPY"?0.076:10;
+  const pnl=(f.type==="buy"?1:-1)*(cl-op)*lo*pv;
+  const netVal=pnl+(parseFloat(f.comm)||0);
+  return`<div style="padding:10px 12px;background:#0D1117;border-radius:6px;display:flex;gap:18px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+    <span style="color:#8B949E;font-size:12px">Gross:</span><span style="font-family:monospace;font-weight:700;font-size:16px;color:${col(pnl)}">${f$(pnl)}</span>
+    <span style="color:#8B949E;font-size:12px">Net:</span><span style="font-family:monospace;font-weight:700;font-size:16px;color:${col(netVal)}">${f$(netVal)}</span>
+  </div>`;
+}
+
+function addButtonsHTML(f,aiLoading){
+  const missing=!f.eP||!f.cP||!f.lots;
+  const missingSave=!f.date||!f.eP||!f.cP||!f.lots;
+  return`<button class="btn-o" onclick="doAnalyse()" ${aiLoading||missing?"disabled":""} style="opacity:${missing?.4:1}">${aiLoading?"Analysing…":"⚡ Analyse with AI"}</button>
+    <button class="btn" onclick="saveTrade()" ${missingSave?"disabled":""} style="opacity:${missingSave?.4:1}">Save Trade</button>`;
+}
+
+// ── Cooldown timer ────────────────────────────────────────────────────────────
+function formatCooldown(ms){
+  const totalSec=Math.max(0,Math.ceil(ms/1000));
+  const m=Math.floor(totalSec/60),s=totalSec%60;
+  return m+":"+String(s).padStart(2,"0");
+}
+
+function dismissCooldown(){
+  state.cooldownUntil=0;
+  localStorage.removeItem("tj_cooldown_until");
+  render();
+}
+
+// Tick every second while a cooldown is active:
+// - On the Add tab, update just the countdown text (no full re-render, preserves form focus)
+// - On other tabs, the header badge needs a full render to update its countdown
+// - When it expires, do exactly one full render to remove all cooldown UI
+setInterval(()=>{
+  if(!state.settings.enableCooldown||state.cooldownUntil<=0)return;
+  const remaining=state.cooldownUntil-Date.now();
+  if(remaining>0){
+    if(state.tab==="add"){
+      const el=document.getElementById("cooldown_timer");
+      if(el)el.textContent=formatCooldown(remaining);
+      const headerEl=document.getElementById("cooldown_header");
+      if(headerEl)headerEl.textContent="🧘 Cooldown "+formatCooldown(remaining);
+    }else{
+      const headerEl=document.getElementById("cooldown_header");
+      if(headerEl)headerEl.textContent="🧘 Cooldown "+formatCooldown(remaining);
+    }
+  }else{
+    state.cooldownUntil=0;
+    localStorage.removeItem("tj_cooldown_until");
+    render();
+  }
+},1000);
 
 function viewSettings(){
   const {settings,trades,importMsg,binKey,binId,syncStatus,syncMsg,lastSync}=state;
@@ -476,6 +616,38 @@ function viewSettings(){
       <div><label class="lbl">Daily Loss Limit ($)</label><input type="number" class="inp" value="${settings.lossLim}" oninput="setSetting('lossLim',this.value)"/></div>
       <div><label class="lbl">Max Trades / Day</label><input type="number" class="inp" value="${settings.maxTrades}" oninput="setSetting('maxTrades',this.value)"/></div>
     </div></div>
+  <div class="panel"><div class="panel-title">🎯 Trading Discipline Rules</div>
+    <div style="color:#8B949E;font-size:12px;line-height:1.6;margin-bottom:14px">Trades outside these windows or lot sizes get flagged in your log — adjust as your sessions or sizing change (e.g. for daylight saving or a new month).</div>
+
+    <div style="margin-bottom:6px"><span style="color:#C9D1D9;font-size:13px;font-weight:600">London Session</span></div>
+    <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:14px">
+      <div><label class="lbl">Start</label><input type="time" class="inp" value="${settings.londonStart}" oninput="setSetting('londonStart',this.value)"/></div>
+      <div><label class="lbl">End</label><input type="time" class="inp" value="${settings.londonEnd}" oninput="setSetting('londonEnd',this.value)"/></div>
+    </div>
+
+    <div style="margin-bottom:6px"><span style="color:#C9D1D9;font-size:13px;font-weight:600">New York Session</span></div>
+    <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:14px">
+      <div><label class="lbl">Start</label><input type="time" class="inp" value="${settings.nyStart}" oninput="setSetting('nyStart',this.value)"/></div>
+      <div><label class="lbl">End</label><input type="time" class="inp" value="${settings.nyEnd}" oninput="setSetting('nyEnd',this.value)"/></div>
+    </div>
+    <div style="color:#555E6D;font-size:11px;margin-bottom:14px">Times are in your device's clock (24h). Update these when daylight saving shifts your sessions.</div>
+
+    <div style="margin-bottom:6px"><span style="color:#C9D1D9;font-size:13px;font-weight:600">Lot Size Limit</span></div>
+    <div class="grid" style="grid-template-columns:1fr;margin-bottom:14px">
+      <div><label class="lbl">Max Lots for This Month</label><input type="number" step="0.01" class="inp" value="${settings.maxLots}" oninput="setSetting('maxLots',this.value)"/></div>
+    </div>
+    <div style="color:#555E6D;font-size:11px;margin-bottom:14px">Update this whenever your normal sizing for the month changes — trades above this get an ⚠️ Oversized tag.</div>
+
+    ${toggle("Flag off-hours trades (⏰)","enableHourFlag",settings.enableHourFlag)}
+    ${toggle("Flag oversized trades (⚠️)","enableLotFlag",settings.enableLotFlag)}
+  </div>
+  <div class="panel"><div class="panel-title">🧘 Cooldown After a Loss</div>
+    <div style="color:#8B949E;font-size:12px;line-height:1.6;margin-bottom:14px">After saving a trade with a negative net P&L, the Add Trade tab shows a countdown reminding you to pause before re-entering. It never blocks you — just a visual nudge.</div>
+    <div class="grid" style="grid-template-columns:1fr;margin-bottom:6px">
+      <div><label class="lbl">Cooldown Duration (minutes)</label><input type="number" step="1" class="inp" value="${settings.cooldownMins}" oninput="setSetting('cooldownMins',this.value)"/></div>
+    </div>
+    ${toggle("Enable cooldown timer","enableCooldown",settings.enableCooldown)}
+  </div>
   <div class="panel"><div class="panel-title">🎨 Display</div>
     ${toggle("Show Psychology Column in Log","showPsych",settings.showPsych)}
     ${toggle("Confirm before deleting trades","confirmDel",settings.confirmDel)}
@@ -568,7 +740,7 @@ function render(){
     <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
       <div>
         <div style="display:flex;align-items:center;gap:8px"><span style="font-size:20px">⬡</span><span style="color:#F0B429;font-size:18px;font-weight:700">${settings.name.toUpperCase()}</span></div>
-        <div style="color:#8B949E;font-size:11px;margin-top:2px">May 2026 · ${trades.length} trades · Avg Psych ${st.psych.toFixed(1)}/5${state.binKey?` · <span style="color:${state.syncStatus==='ok'?'#4ADE80':state.syncStatus==='error'?'#F87171':'#F0B429'}">☁️ ${state.syncStatus==='ok'?'Synced':state.syncStatus==='syncing'?'Syncing…':'Cloud linked'}</span>`:''}</div>
+        <div style="color:#8B949E;font-size:11px;margin-top:2px">May 2026 · ${trades.length} trades · Avg Psych ${st.psych.toFixed(1)}/5${state.binKey?` · <span style="color:${state.syncStatus==='ok'?'#4ADE80':state.syncStatus==='error'?'#F87171':'#F0B429'}">☁️ ${state.syncStatus==='ok'?'Synced':state.syncStatus==='syncing'?'Syncing…':'Cloud linked'}</span>`:''}${(state.settings.enableCooldown&&state.cooldownUntil>Date.now())?` · <span id="cooldown_header" style="color:#F87171">🧘 Cooldown ${formatCooldown(state.cooldownUntil-Date.now())}</span>`:''}</div>
       </div>
     </div>
     <div class="tabs">${TABS.map(t=>`<button class="tab${tab===t.id?" active":""}" onclick="setState({tab:'${t.id}'})">${t.l}</button>`).join("")}</div>
@@ -599,11 +771,25 @@ function setSetting(k,v){state.settings[k]=v==="true"?true:v==="false"?false:v;r
 function toggleSetting(k){state.settings[k]=!state.settings[k];render();}
 function resetSettings(){setState({settings:{...DEFSETT}});}
 
+function addNoteTag(tag){
+  if(!state.addForm)state.addForm=blankForm();
+  const existing=state.addForm.notes||"";
+  state.addForm.notes=existing?existing+" · "+tag:tag;
+  state.addForm.psych=1; // these patterns are almost always a low-psychology moment
+  render();
+}
+
 function formChange(id,val){
   if(!state.addForm)state.addForm=blankForm();
   const map={f_date:"date",f_eT:"eT",f_cT:"cT",f_type:"type",f_sym:"sym",f_lots:"lots",f_eP:"eP",f_cP:"cP",f_comm:"comm",f_exit:"exit",f_tv:"tv",f_notes:"notes"};
   if(map[id])state.addForm[map[id]]=val;
-  render();
+  // Update only the live preview + buttons, WITHOUT re-rendering the whole form
+  // (a full render() would destroy/recreate the input and close the keyboard)
+  const f=state.addForm;
+  const previewEl=document.getElementById("pnl_preview");
+  if(previewEl)previewEl.innerHTML=pnlPreviewHTML(f);
+  const btnsEl=document.getElementById("add_buttons");
+  if(btnsEl)btnsEl.innerHTML=addButtonsHTML(f,state.aiLoading);
 }
 
 function setPsych(ctx,val){
@@ -634,7 +820,16 @@ function saveTrade(){
   const f=state.addForm;
   if(!f||!f.date||!f.eP||!f.cP||!f.lots)return;
   const pnl=calcFormPnl(f);
-  state.trades.push({id:Date.now(),date:f.date,eT:f.eT,cT:f.cT,type:f.type,sym:f.sym,lots:parseFloat(f.lots),eP:parseFloat(f.eP),cP:parseFloat(f.cP),pnl,comm:parseFloat(f.comm)||0,exit:f.exit,psych:f.psych,tv:f.tv,notes:f.notes});
+  const comm=parseFloat(f.comm)||0;
+  const netVal=pnl+comm;
+  state.trades.push({id:Date.now(),date:f.date,eT:f.eT,cT:f.cT,type:f.type,sym:f.sym,lots:parseFloat(f.lots),eP:parseFloat(f.eP),cP:parseFloat(f.cP),pnl,comm,exit:f.exit,psych:f.psych,tv:f.tv,notes:f.notes});
+  // Start a cooldown if this trade lost money
+  if(state.settings.enableCooldown&&netVal<0){
+    const mins=parseFloat(state.settings.cooldownMins)||30;
+    const until=Date.now()+mins*60*1000;
+    state.cooldownUntil=until;
+    localStorage.setItem("tj_cooldown_until",String(until));
+  }
   setState({tab:"log",addForm:null,aiText:null,expandedRow:null});
   autoSync();
 }
